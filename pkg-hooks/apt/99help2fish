@@ -1,0 +1,6 @@
+// /etc/apt/apt.conf.d/99help2fish
+// Best-effort: after each apt run, generate fish completions for newly
+// installed commands. Installed by pkg-hooks/install-apt-hook.fish.
+DPkg::Post-Invoke {
+    "if [ -x /usr/local/share/help2fish/help2fish-pkghook-apt ]; then /usr/local/share/help2fish/help2fish-pkghook-apt || true; fi";
+};

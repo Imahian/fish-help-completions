@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+
+# junk that probed binaries may drop into the cwd — never commit these
+--help
+--help.*
+*.tmp
+*.fit
+*.wav
+*.log
+tmp/
+clblast_*.json
+affixcompress*

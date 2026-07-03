@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""
+help2fish-pkghook — package-manager integration.
+
+Receives a list of just-installed executables (as file paths, on argv or stdin)
+and generates fish completions for each, then prints a one-block summary. Meant
+to be called from a pacman ALPM hook, an apt Post-Invoke, or a pip/pipx wrapper.
+
+Paths are read from argv first, else from stdin (one per line, as pacman feeds
+them with `NeedsTargets`, e.g. "usr/bin/nmap").
+
+Env:
+  HELP2FISH_ENGINE   path to help2fish.py   (default: alongside this script)
+  HELP2FISH_OUT      output dir for .fish   (default: /usr/share/fish/vendor_completions.d)
+  HELP2FISH_DEPTH    recursion depth        (default: 2)
+"""
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ENGINE = os.environ.get("HELP2FISH_ENGINE", os.path.join(HERE, "help2fish.py"))
+OUTDIR = os.environ.get("HELP2FISH_OUT", "/usr/share/fish/vendor_completions.d")
+DEPTH = os.environ.get("HELP2FISH_DEPTH", "2")
+
+BIN_DIRS = ("bin/", "sbin/", "usr/bin/", "usr/sbin/", "usr/local/bin/", "usr/local/sbin/")
+COUNT_RE = re.compile(r":\s*(\d+) flags,\s*(\d+) subcommands")
+
+
+def collect_paths():
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if args:
+        return args
+    if not sys.stdin.isatty():
+        return [ln.strip() for ln in sys.stdin if ln.strip()]
+    return []
+
+
+def is_binary_path(p):
+    p = p.lstrip("/")
+    return any(seg in p for seg in ("bin/", "sbin/")) and not p.endswith("/")
+
+
+def main():
+    if not os.path.exists(ENGINE):
+        print(f"help2fish: engine not found at {ENGINE}", file=sys.stderr)
+        return 1
+
+    names = []
+    seen = set()
+    for p in collect_paths():
+        if not is_binary_path(p):
+            continue
+        name = os.path.basename(p.rstrip("/"))
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+
+    if not names:
+        return 0
+
+    created = updated = skipped = 0
+    tflags = tsubs = 0
+    conflicts = []
+
+    for name in names:
+        try:
+            r = subprocess.run(
+                [sys.executable, ENGINE, name, "--out", OUTDIR, "--depth", DEPTH, "--force"],
+                capture_output=True, text=True, timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            conflicts.append((name, str(e)))
+            continue
+        out = (r.stdout or "") + (r.stderr or "")
+        m = COUNT_RE.search(out)
+        if m and ("created" in out or "updated" in out):
+            f, s = int(m.group(1)), int(m.group(2))
+            tflags += f
+            tsubs += s
+            if "updated" in out:
+                updated += 1
+            else:
+                created += 1
+        elif "already exists" in out:
+            skipped += 1
+        else:
+            reason = out.strip().split(":")[-1].strip() or "unparseable"
+            conflicts.append((name, reason))
+
+    # summary block (prints inside pacman/apt output)
+    print("──[ help2fish ]" + "─" * 40)
+    print(f"  completions generated: {created} new, {updated} updated"
+          f"  ({tflags} flags, {tsubs} subcommands)")
+    if skipped:
+        print(f"  left untouched (vendor/manual): {skipped}")
+    if conflicts:
+        print(f"  could not generate: {len(conflicts)}  ← report these upstream")
+        for name, why in conflicts[:12]:
+            print(f"    - {name}: {why}")
+        log = os.path.expanduser("~/.cache/help2fish/pkghook-conflicts.txt")
+        try:
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+            with open(log, "a") as fh:
+                for name, why in conflicts:
+                    fh.write(f"{name}\t{why}\n")
+        except OSError:
+            pass
+    print("─" * 54)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

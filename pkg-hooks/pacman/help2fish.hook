@@ -1,0 +1,16 @@
+# /etc/pacman.d/hooks/help2fish.hook
+# Generate fish completions for newly installed commands (covers pacman, yay,
+# paru — all use libalpm). Installed by pkg-hooks/install-pacman-hook.fish.
+
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = usr/bin/*
+Target = usr/local/bin/*
+
+[Action]
+Description = Generating fish completions (help2fish)...
+When = PostTransaction
+Exec = /usr/local/share/help2fish/help2fish-pkghook
+NeedsTargets
