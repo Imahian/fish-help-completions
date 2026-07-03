@@ -95,6 +95,35 @@ help2fish --all report
 `--all` runs `--help` on thousands of binaries, so it takes a while. Day to day you
 don't need it — the background hook covers new commands as you use them.
 
+### See what's covered (`--status`)
+
+A **read-only** audit — it executes no binaries, it only inspects existing
+completion files, man pages, and the conflict log:
+
+```fish
+help2fish --status          # counts only
+help2fish --status --list   # also list the command names
+```
+
+```
+help2fish --status  (read-only; no binaries executed)
+────────────────────────────────────────────────────
+  total commands in $PATH         5350
+  with suggestions                3467
+    ├─ by help2fish                127
+    ├─ by vendor/handwritten        22
+    └─ by man page (fish)         3318
+  WITHOUT suggestions             1883
+  known errors (from logs)           4
+────────────────────────────────────────────────────
+```
+
+- **WITHOUT suggestions** — no completion and no man page; these are what
+  `help2fish` can fill (run the command once, or `help2fish <name>`).
+- **known errors** — commands whose `--help` gave nothing usable, recorded to
+  `~/.cache/help2fish/report.txt` as you use them (name + reason), so you can see
+  exactly what needs a parser fix. A later successful run clears its entry.
+
 ## Package-manager integration
 
 Generate completions **at install time**, so the moment you install a tool its flags

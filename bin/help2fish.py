@@ -415,10 +415,50 @@ class Result:
         self.path, self.detail = path, detail
 
 
-def generate_one(cmd, depth, outdir, force):
+CONFLICT_LOG = "~/.cache/help2fish/report.txt"
+
+
+def log_failure(name, status, detail):
+    """Record a failed generation so `--status` can surface it later without
+    re-probing. Deduped by command name."""
+    p = os.path.expanduser(CONFLICT_LOG)
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        existing = {}
+        if os.path.exists(p):
+            with open(p) as f:
+                for line in f:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) == 3:
+                        existing[parts[1]] = (parts[0], parts[2])
+        existing[name] = (status, detail)
+        with open(p, "w") as f:
+            for n, (s, d) in sorted(existing.items()):
+                f.write(f"{s}\t{n}\t{d}\n")
+    except OSError:
+        pass
+
+
+def clear_failure(name):
+    """Drop a command from the conflict log (it now succeeds)."""
+    p = os.path.expanduser(CONFLICT_LOG)
+    if not os.path.exists(p):
+        return
+    try:
+        with open(p) as f:
+            lines = [ln for ln in f if ln.rstrip("\n").split("\t")[1:2] != [name]]
+        with open(p, "w") as f:
+            f.writelines(lines)
+    except OSError:
+        pass
+
+
+def generate_one(cmd, depth, outdir, force, log=True):
     """Generate a completion for one command. Returns a Result.
 
-    status ∈ created | updated | vendor | man | nohelp | empty | error
+    status ∈ created | updated | vendor | have | nohelp | empty | error
+    When `log` is True, failures are appended to the conflict log so `--status`
+    can report them. Batch callers pass log=False and write their own log.
     """
     if "/" in cmd:
         cmd = os.path.basename(cmd)
@@ -431,16 +471,21 @@ def generate_one(cmd, depth, outdir, force):
         # never clobber handwritten / vendor completions
         return Result(cmd, "vendor", path=outpath)
 
+    def fail(status, detail):
+        if log:
+            log_failure(cmd, status, detail)
+        return Result(cmd, status, detail=detail)
+
     if get_help([cmd]) is None:
-        return Result(cmd, "nohelp", detail="no --help/-h output")
+        return fail("nohelp", "no --help/-h output")
 
     try:
         tree = build_tree([cmd], depth, set())
     except Exception as e:  # never let one bad command abort a batch
-        return Result(cmd, "error", detail=str(e))
+        return fail("error", str(e))
 
     if not tree["flags"] and not tree["subs"]:
-        return Result(cmd, "empty", detail="help present but nothing parseable")
+        return fail("empty", "help present but nothing parseable")
 
     content = emit(cmd, tree)
     nf, ns = count_flags(tree), count_subs(tree)
@@ -449,8 +494,114 @@ def generate_one(cmd, depth, outdir, force):
         with open(outpath, "w") as f:
             f.write(content)
     except OSError as e:
-        return Result(cmd, "error", detail=str(e))
+        return fail("error", str(e))
+    if log:
+        clear_failure(cmd)  # succeeded — remove any stale error entry
     return Result(cmd, "updated" if exists else "created", nf, ns, outpath)
+
+
+FISH_COMPLETION_DIRS = [
+    "~/.config/fish/completions",
+    "~/.local/share/fish/vendor_completions.d",
+    "/etc/fish/completions",
+    "/usr/local/share/fish/vendor_completions.d",
+    "/usr/share/fish/vendor_completions.d",
+    "~/.cache/fish/generated_completions",
+]
+
+
+def completion_source(name, outdir):
+    """Where a command's completion comes from, without executing anything.
+    Returns (kind, path): kind ∈ help2fish | vendor | fish-man | None."""
+    ours = os.path.join(outdir, f"{name}.fish")
+    if os.path.exists(ours) and is_ours(ours):
+        return "help2fish", ours
+    for d in FISH_COMPLETION_DIRS:
+        p = os.path.join(os.path.expanduser(d), f"{name}.fish")
+        if os.path.exists(p):
+            # generated_completions == fish's own man-derived cache
+            if "generated_completions" in d:
+                return "fish-man", p
+            return "vendor", p
+    return None, None
+
+
+def read_conflict_logs():
+    """Return {name: reason} from prior --all / pkghook runs (read-only)."""
+    conflicts = {}
+    for path in ("~/.cache/help2fish/report.txt",
+                 "~/.cache/help2fish/pkghook-conflicts.txt"):
+        p = os.path.expanduser(path)
+        try:
+            with open(p) as f:
+                for line in f:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) >= 2:
+                        name, reason = parts[-2], parts[-1]
+                        conflicts[name] = reason
+        except OSError:
+            continue
+    return conflicts
+
+
+def run_status(outdir, show_lists=False):
+    """Read-only audit: which commands have completions, which don't, which
+    previously errored. Executes NO binaries."""
+    have_man = _man_available()
+    conflicts = read_conflict_logs()
+
+    buckets = {"help2fish": [], "vendor": [], "fish-man": [], "none": []}
+    for name in iter_path_commands():
+        kind, _ = completion_source(name, outdir)
+        if kind is None:
+            if have_man and has_man(name):
+                buckets["fish-man"].append(name)
+            else:
+                buckets["none"].append(name)
+        else:
+            buckets[kind].append(name)
+
+    total = sum(len(v) for v in buckets.values())
+    covered = len(buckets["help2fish"]) + len(buckets["vendor"]) + len(buckets["fish-man"])
+
+    print("help2fish --status  (read-only; no binaries executed)")
+    print("────────────────────────────────────────────────────")
+    print(f"  total commands in $PATH        {total:>5}")
+    print(f"  with suggestions               {covered:>5}")
+    print(f"    ├─ by help2fish              {len(buckets['help2fish']):>5}")
+    print(f"    ├─ by vendor/handwritten     {len(buckets['vendor']):>5}")
+    print(f"    └─ by man page (fish)        {len(buckets['fish-man']):>5}")
+    print(f"  WITHOUT suggestions            {len(buckets['none']):>5}")
+    print(f"  known errors (from logs)       {len(conflicts):>5}")
+    print("────────────────────────────────────────────────────")
+    print("  run 'help2fish <name>' to add one, or check the log:")
+    print("    ~/.cache/help2fish/report.txt")
+
+    if show_lists:
+        if buckets["none"]:
+            print(f"\n  WITHOUT suggestions ({len(buckets['none'])}):")
+            _print_columns(sorted(buckets["none"]))
+        if conflicts:
+            print(f"\n  errors / unparseable ({len(conflicts)}):")
+            for name in sorted(conflicts):
+                print(f"    - {name}: {conflicts[name]}")
+        if buckets["help2fish"]:
+            print(f"\n  added by help2fish ({len(buckets['help2fish'])}):")
+            _print_columns(sorted(buckets["help2fish"]))
+
+
+def _man_available():
+    try:
+        subprocess.run(["man", "-w", "man"], capture_output=True, timeout=5)
+        return True
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _print_columns(items, width=4):
+    for i in range(0, len(items), width):
+        row = items[i:i + width]
+        print("    " + "".join(f"{x:<22}" for x in row).rstrip())
 
 
 def iter_path_commands():
@@ -485,7 +636,7 @@ def run_all(depth, outdir, force, quiet=False):
         if not os.path.exists(outpath) and has_man(name):
             buckets["man"].append(Result(name, "man"))
             continue
-        r = generate_one(name, depth, outdir, force)
+        r = generate_one(name, depth, outdir, force, log=False)
         buckets[r.status].append(r)
         if not quiet and r.status in ("created", "updated"):
             print(f"  + {name}: {r.flags} flags, {r.subs} subcommands")
@@ -529,6 +680,9 @@ def main():
     ap = argparse.ArgumentParser(prog="help2fish", add_help=True)
     ap.add_argument("command", nargs="?", help="command to generate for (omit with --all)")
     ap.add_argument("--all", action="store_true", help="generate for every command in $PATH")
+    ap.add_argument("--status", action="store_true",
+                    help="read-only audit: what has completions, what doesn't, what errored")
+    ap.add_argument("--list", action="store_true", help="with --status, also list the names")
     ap.add_argument("--depth", type=int, default=2, help="subcommand recursion depth (default 2)")
     ap.add_argument("--out", default=None, help="output dir (default ~/.config/fish/completions)")
     ap.add_argument("--stdout", action="store_true", help="print to stdout instead of writing file")
@@ -537,6 +691,10 @@ def main():
     args = ap.parse_args()
 
     outdir = args.out or default_outdir()
+
+    if args.status:
+        run_status(outdir, show_lists=args.list)
+        return
 
     if args.all:
         run_all(args.depth, outdir, args.force, quiet=args.quiet)
