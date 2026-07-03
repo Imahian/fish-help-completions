@@ -40,14 +40,28 @@ def _safe_env():
     return env
 
 
+def _probe_cwd():
+    """An isolated directory to run probes in, so a binary that dumps files on
+    --help (config, caches, .fit/.wav/.json artifacts) pollutes here and not the
+    user's working directory."""
+    d = os.path.expanduser("~/.cache/help2fish/probe")
+    try:
+        os.makedirs(d, exist_ok=True)
+        return d
+    except OSError:
+        return None
+
+
 def get_help(argv):
     """Run `argv --help` (and fallbacks); return combined stdout+stderr or None.
 
-    Runs each probe in its own process group with stdin closed and no display,
-    and kills the whole group on timeout — so a binary that ignores --help and
-    tries to launch (a GUI, a REPL, a daemon) cannot linger or open a window.
+    Runs each probe in its own process group with stdin closed, no display, and
+    an isolated cwd, and kills the whole group on timeout — so a binary that
+    ignores --help and tries to launch (a GUI, a REPL, a daemon) cannot linger,
+    open a window, or litter the user's directory.
     """
     env = _safe_env()
+    cwd = _probe_cwd()
     for flag in HELP_FLAGS:
         try:
             p = subprocess.Popen(
@@ -57,6 +71,7 @@ def get_help(argv):
                 stderr=subprocess.PIPE,
                 text=True,
                 env=env,
+                cwd=cwd,
                 start_new_session=True,  # own process group
             )
         except OSError:
